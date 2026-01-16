@@ -11,12 +11,18 @@ import re
 import types
 import dbm
 import subprocess
+import hashlib
 
 import yt_dlp.networking.impersonate
 from dl_formats import get_format, get_opts, AUDIO_FORMATS
 from datetime import datetime
 
 log = logging.getLogger('ytdl')
+
+def generate_entry_id(url):
+    """Generate a unique ID for entries that don't have one."""
+    url_hash = hashlib.md5(url.encode()).hexdigest()[:11]
+    return f"{url_hash}"
 
 def _convert_generators_to_lists(obj):
     """Recursively convert generators to lists in a dictionary to make it pickleable."""
@@ -68,13 +74,13 @@ class DownloadInfo:
 class Download:
     manager = None
 
-    def __init__(self, download_dir, temp_dir, output_template, output_template_chapter, quality, format, ytdl_opts, info, cookies_from_browser=''):
+    def __init__(self, download_dir, temp_dir, output_template, output_template_chapter, quality, format, ytdl_opts, info):
         self.download_dir = download_dir
         self.temp_dir = temp_dir
         self.output_template = output_template
         self.output_template_chapter = output_template_chapter
         self.format = get_format(format, quality)
-        self.ytdl_opts = get_opts(format, quality, ytdl_opts, cookies_from_browser)
+        self.ytdl_opts = get_opts(format, quality, ytdl_opts)
         if "impersonate" in self.ytdl_opts:
             self.ytdl_opts["impersonate"] = yt_dlp.networking.impersonate.ImpersonateTarget.from_str(self.ytdl_opts["impersonate"])
         self.info = info
@@ -163,8 +169,14 @@ class Download:
         self.notifier = notifier
         self.info.status = 'preparing'
         await self.notifier.updated(self.info)
-        asyncio.create_task(self.update_status())
-        return await self.loop.run_in_executor(None, self.proc.join)
+        self.update_status_task = asyncio.create_task(self.update_status())
+        result = await self.loop.run_in_executor(None, self.proc.join)
+        # Signal update_status task to finish by putting None in queue
+        if self.status_queue is not None and not self.update_status_task.done():
+            await self.loop.run_in_executor(None, self.status_queue.put, None)
+        # Wait for status updates to finish processing
+        await self.update_status_task
+        return result
 
     def cancel(self):
         log.info(f"Cancelling download: {self.info.title}")
@@ -181,7 +193,7 @@ class Download:
         log.info(f"Closing download process for: {self.info.title}")
         if self.started():
             self.proc.close()
-            if self.status_queue is not None:
+            if self.status_queue is not None and hasattr(self, 'update_status_task') and not self.update_status_task.done():
                 self.status_queue.put(None)
 
     def running(self):
@@ -225,12 +237,17 @@ class Download:
                 # Skip the rest of status processing for chapter files
                 continue
             
-            self.info.status = status['status']
+            # Prevent status from going backwards: once finished, stay finished until final merge
+            # This prevents UI progress bar from resetting when audio download starts
+            if self.info.status != 'finished' or status['status'] == 'finished':
+                self.info.status = status['status']
             self.info.msg = status.get('msg')
             if 'downloaded_bytes' in status:
                 total = status.get('total_bytes') or status.get('total_bytes_estimate')
                 if total:
-                    self.info.percent = status['downloaded_bytes'] / total * 100
+                    new_percent = status['downloaded_bytes'] / total * 100
+                    if not hasattr(self.info, 'percent') or self.info.percent is None or new_percent >= self.info.percent:
+                        self.info.percent = new_percent
             self.info.speed = status.get('speed')
             self.info.eta = status.get('eta')
             log.debug(f"Updating status for {self.info.title}: {status}")
@@ -251,7 +268,7 @@ class PersistentQueue:
 
     def load(self):
         for k, v in self.saved_items():
-            self.dict[k] = Download(None, None, None, None, None, None, {}, v, '')
+            self.dict[k] = Download(None, None, None, None, None, None, {}, v)
 
     def exists(self, key):
         return key in self.dict
@@ -442,22 +459,26 @@ class DownloadQueue:
                 if success:
                     log.info(f"Uploaded segment to S3: {s3_url}")
                     uploaded_count += 1
-                    try:
-                        os.remove(segment_path)
-                    except Exception as e:
-                        log.warning(f"Failed to delete segment {segment_path}: {str(e)}")
                 else:
                     log.error(f"Failed to upload segment {segment_file}: {msg}")
+                try:
+                    os.remove(segment_path)
+                    log.debug(f"Deleted segment: {segment_path} (S3 success: {success})")
+                except Exception as e:
+                    log.warning(f"Failed to delete segment {segment_path}: {str(e)}")
             
             # Clean up
             try:
-                os.remove(file_path)
-                log.info(f"Deleted original file: {file_path}")
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                    log.info(f"Deleted original file: {file_path}")
             except Exception as e:
                 log.warning(f"Failed to delete original file {file_path}: {str(e)}")
             
             try:
-                os.rmdir(segment_dir)
+                if os.path.exists(segment_dir):
+                    os.rmdir(segment_dir)
+                    log.debug(f"Deleted segment directory: {segment_dir}")
             except Exception as e:
                 log.warning(f"Failed to delete segment directory {segment_dir}: {str(e)}")
             
@@ -475,6 +496,7 @@ class DownloadQueue:
     def _upload_to_s3_after_download(self, download):
         """Upload completed download to S3 and delete local file. Returns True if successful."""
         try:
+            log.info(f"Starting S3 auto-upload for: {download.info.title}")
             from s3_upload import create_s3_uploader
             s3_uploader = create_s3_uploader(self.config)
             if not s3_uploader:
@@ -489,6 +511,7 @@ class DownloadQueue:
                 return False
             
             file_path = os.path.join(dldirectory, download.info.filename)
+            log.debug(f"File path for S3 upload: {file_path}, exists: {os.path.exists(file_path)}")
             
             # Segment and upload if segmentation is enabled
             if self.config.SEGMENT_DURATION and int(self.config.SEGMENT_DURATION) > 0:
@@ -501,15 +524,16 @@ class DownloadQueue:
                 success, msg, s3_url = s3_uploader.upload_file(file_path, s3_key)
                 if success:
                     log.info(f"Auto-uploaded to S3: {s3_url}")
-                    try:
-                        os.remove(file_path)
-                        log.info(f"Deleted local file after S3 upload: {file_path}")
-                    except Exception as e:
-                        log.warning(f"Failed to delete local file {file_path}: {str(e)}")
                     main_success = True
                 else:
                     log.error(f"S3 upload failed: {msg}")
                     main_success = False
+                try:
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                        log.info(f"Deleted local file: {file_path} (S3 success: {success})")
+                except Exception as e:
+                    log.warning(f"Failed to delete local file {file_path}: {str(e)}")
             
             chapter_success = True
             if hasattr(download.info, 'chapter_files') and download.info.chapter_files:
@@ -522,14 +546,15 @@ class DownloadQueue:
                     ch_success, ch_msg, ch_s3_url = s3_uploader.upload_file(chapter_path, chapter_s3_key)
                     if ch_success:
                         log.info(f"Auto-uploaded chapter to S3: {ch_s3_url}")
-                        try:
-                            os.remove(chapter_path)
-                            log.info(f"Deleted local chapter file: {chapter_path}")
-                        except Exception as e:
-                            log.warning(f"Failed to delete chapter file {chapter_path}: {str(e)}")
                     else:
                         log.error(f"Failed to upload chapter {chapter_filename}: {ch_msg}")
                         chapter_success = False
+                    try:
+                        if os.path.exists(chapter_path):
+                            os.remove(chapter_path)
+                            log.info(f"Deleted local chapter file: {chapter_path} (S3 success: {ch_success})")
+                    except Exception as e:
+                        log.warning(f"Failed to delete chapter file {chapter_path}: {str(e)}")
             
             return main_success and chapter_success
                         
@@ -538,7 +563,9 @@ class DownloadQueue:
             return False
 
     def _post_download_cleanup(self, download):
+        log.debug(f"Post-download cleanup for {download.info.title}: status={download.info.status}")
         if download.info.status != 'finished':
+            log.warning(f"Download {download.info.title} has non-finished status: {download.info.status}")
             if download.tmpfilename and os.path.isfile(download.tmpfilename):
                 try:
                     os.remove(download.tmpfilename)
@@ -551,6 +578,7 @@ class DownloadQueue:
             if download.canceled:
                 asyncio.create_task(self.notifier.canceled(download.info.url))
             else:
+                log.debug(f"Checking S3 upload: status={download.info.status}, S3_BUCKET={self.config.S3_BUCKET}")
                 if download.info.status == 'finished' and self.config.S3_BUCKET:
                     s3_success = self._upload_to_s3_after_download(download)
                     if not s3_success:
@@ -610,7 +638,7 @@ class DownloadQueue:
         if playlist_item_limit > 0:
             log.info(f'playlist limit is set. Processing only first {playlist_item_limit} entries')
             ytdl_options['playlistend'] = playlist_item_limit
-        download = Download(dldirectory, self.config.TEMP_DIR, output, output_chapter, dl.quality, dl.format, ytdl_options, dl, self.config.COOKIES_FROM_BROWSER)
+        download = Download(dldirectory, self.config.TEMP_DIR, output, output_chapter, dl.quality, dl.format, ytdl_options, dl)
         if auto_start is True:
             self.queue.put(download)
             asyncio.create_task(self.__start_download(download))
@@ -647,9 +675,13 @@ class DownloadQueue:
             if playlist_item_limit > 0:
                 log.info(f'Playlist item limit is set. Processing only first {playlist_item_limit} entries')
                 entries = entries[:playlist_item_limit]
+            playlist_id = entry.get("id") or generate_entry_id(entry.get('webpage_url') or entry.get('url', 'unknown'))
+            if not entry.get("id"):
+                log.debug(f'Playlist missing ID, generated: {playlist_id}')
+            
             for index, etr in enumerate(entries, start=1):
                 etr["_type"] = "video"
-                etr["playlist"] = entry["id"]
+                etr["playlist"] = playlist_id
                 etr["playlist_index"] = '{{0:0{0:d}d}}'.format(playlist_index_digits).format(index)
                 for property in ("id", "title", "uploader", "uploader_id"):
                     if property in entry:
@@ -658,11 +690,26 @@ class DownloadQueue:
             if any(res['status'] == 'error' for res in results):
                 return {'status': 'error', 'msg': ', '.join(res['msg'] for res in results if res['status'] == 'error' and 'msg' in res)}
             return {'status': 'ok'}
-        elif etype == 'video' or (etype.startswith('url') and 'id' in entry and 'title' in entry):
-            log.debug('Processing as a video')
+        elif etype == 'video' or etype.startswith('url'):
+            log.debug(f'Processing as a {etype}')
             key = entry.get('webpage_url') or entry['url']
             if not self.queue.exists(key):
-                dl = DownloadInfo(entry['id'], entry.get('title') or entry['id'], key, quality, format, folder, custom_name_prefix, error, entry, playlist_item_limit, split_by_chapters, chapter_template)
+                if not entry.get('id') and key:
+                    try:
+                        log.debug(f'Entry missing ID, attempting to extract from URL: {key}')
+                        extracted = await asyncio.get_running_loop().run_in_executor(None, self.__extract_info, key)
+                        if extracted and extracted.get('id'):
+                            entry['id'] = extracted['id']
+                            entry['title'] = extracted.get('title') or entry.get('title')
+                            log.debug(f'Extracted ID from URL: {extracted["id"]}')
+                    except Exception as e:
+                        log.debug(f'Could not extract ID from URL, will generate generic: {e}')
+                entry_id = entry.get('id') or generate_entry_id(key)
+                entry_title = entry.get('title') or entry_id
+                if not entry.get('id'):
+                    log.debug(f'Entry still missing ID after extraction, generated: {entry_id}')
+                
+                dl = DownloadInfo(entry_id, entry_title, key, quality, format, folder, custom_name_prefix, error, entry, playlist_item_limit, split_by_chapters, chapter_template)
                 await self.__add_download(dl, auto_start)
             return {'status': 'ok'}
         return {'status': 'error', 'msg': f'Unsupported resource "{etype}"'}

@@ -62,7 +62,7 @@ class Config:
         'PUBLIC_HOST_AUDIO_URL': 'audio_download/',
         'OUTPUT_TEMPLATE': '%(title)s.%(ext)s',
         'OUTPUT_TEMPLATE_CHAPTER': '%(title)s - %(section_number)02d - %(section_title)s.%(ext)s',
-        'OUTPUT_TEMPLATE_PLAYLIST': '%(playlist_title)s/%(title)s.%(ext)s',
+        'OUTPUT_TEMPLATE_PLAYLIST': '%(title)s.%(ext)s',
         'DEFAULT_OPTION_PLAYLIST_ITEM_LIMIT' : '0',
         'YTDL_OPTIONS': '{}',
         'YTDL_OPTIONS_FILE': '',
@@ -81,7 +81,6 @@ class Config:
         'S3_REGION': 'us-east-1',
         'S3_PREFIX': '',
         'S3_ENDPOINT_URL': '',
-        'COOKIES_FROM_BROWSER': '',
         'SEGMENT_DURATION': '30',
     }
 
